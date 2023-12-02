@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+LC_ALL=C
+
+source .env
+
+C_RESET='\e[0m'
+C_RED='\e[31m'
+C_GREEN='\e[32m'
+C_YELLOW='\e[33m'
+
+# Наличие ошибки в коде
+ERROR_IN_CODE=0
+
+# Сообщения ошибок
+ERROR_MESSAGE=()
+
+current_branch="$(git rev-parse --abbrev-ref HEAD)"
+task_regex="${JIRA_PROJECT_NAME}-[0-9]+"
+branch_regex="^HEAD|(feature|bugfix|release|hotfix)\/${task_regex}"
+err_base='.git/hooks/pre-commit: Коммит отменён!'
+message="$err_base Не верное имя ветки $current_branch. Не соответствует формату: $branch_regex. Переименуйте и попробуйте снова."
+
+if ! grep -iqE "$branch_regex" <<< "$current_branch"; then
+    echo "$message"
+    exit 1
+fi
+
+gitmodified="git diff --diff-filter=ADMR --name-only --cached -- $APP_CODE_PATH_HOST/local | grep '.php$'"
+
+# Запуск валидации кода
+# Описание:
+## - проверяем измененные, новые файлы в git в папках local
+## - если есть такие файлы, то запускаем PHPStan и PHP-CS-Fixer
+# run(gitmodified)
+function run() {
+  local output phpstan phpcsfixer
+
+  output=$(eval "$1" 2>&1)
+
+  if [[ "$output" != "" ]]; then
+    checkDocker
+    checkPhpContainer
+
+    echo -e
+
+    scanCode "1/2" "PHPStan" "make dc-stan" "make dc-stan"
+    scanCode "2/2" "PHP-CS-Fixer" "make dc-cs" "make dc-cs-debug"
+
+    checkError
+  else
+    echo -e "\n${C_GREEN}¯\_(ツ)_/¯ Отсутствует код для анализа.${C_RESET}\n"
+  fi
+}
+
+# Проверка docker
+function checkDocker() {
+  if ! docker info >/dev/null 2>&1; then
+    echo -e "${C_RED}В этом скрипте используется докер. Пожалуйста, запустите его и попробуйте еще раз."
+    exit 1
+  fi
+}
+
+# Проверка PHP-контейнера
+function checkPhpContainer() {
+  if ! (docker ps | grep -q "${COMPOSE_PROJECT_NAME}"-php); then
+    echo -e "${C_RED}Этот скрипт требует наличие запущенного PHP-контейнера. Пожалуйста, запустите его и попробуйте еще раз."
+    exit 1
+  fi
+}
+
+# Сканирование кода на наличие ошибок
+## __scan(step, name, cmd, msg)
+function scanCode() {
+  # shellcheck disable=SC2034
+  local color output exitcode
+
+  printf "${C_YELLOW}[%s]${C_RESET} %-20s" "$1" "$2"
+  # shellcheck disable=SC2034
+  output=$(eval "$3" 2>&1)
+  exitcode=$?
+
+  # shellcheck disable=SC2053
+  if [[ 0 == $exitcode || 130 == $exitcode || 127 == $exitcode ]]; then
+    echo -e "${C_GREEN}OK!${C_RESET}"
+  else
+    echo -e "${C_RED}ERROR!${C_RESET}"
+
+    # Записываем сообщения ошибок для разных анализаторов кода
+    ERROR_MESSAGE+=("\n${C_YELLOW}Используйте ${C_GREEN}$4${C_YELLOW} для вывода ошибок.")
+
+    # Записываем "наличие ошибки" в переменную
+    ERROR_IN_CODE=1
+  fi
+}
+
+# Проверка на наличие ошибок в коде, для прерывания выполнения скрипта
+function checkError() {
+  if [[ 1 == "${ERROR_IN_CODE}" ]]; then
+    echo -e "\n${C_RED}(╯°□°）╯ Пожалуйста, исправьте ошибки перед добавлением в коммит."
+    echo -e "${ERROR_MESSAGE[*]}"
+
+    exit 1
+  fi
+}
+
+# Запуск анализа кода.
+run "${gitmodified}"
+
+exit 0
